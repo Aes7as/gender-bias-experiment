@@ -119,16 +119,16 @@ do charts/plot_gender.do results
 
 绘图读取 `results/summary.csv`。`experiment01` 的脚本输出到 `results/charts/`，其余目录的脚本输出到 `results/`。绘制新运行时，将参数 `results` 换成该次运行目录，例如 `results/new_run`。
 
-## 许可证状态与建议
+## 许可证
 
-**当前尚未正式指定许可证。以下是待项目作者确认的建议，不构成已经生效的授权声明。**
+本仓库按内容类型分别授权：
 
-- **代码：建议采用 [MIT License](https://choosealicense.com/licenses/mit/)**。允许使用、修改和分发，包括商业用途，要求保留版权及许可声明，并提供免责条款。
-- **Report、说明文档、原创图表及可由作者授权的数据整理成果：建议采用 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.zh-hans)**。允许分享、改编及商业使用，要求适当署名、提供许可证链接，并说明修改。署名可使用作者选定的公开名称或项目名称，无需在 README 中公开真实姓名或邮箱。
+- **代码采用 [MIT License](LICENSE)**，适用于各实验目录中的 Python 程序、测试代码及 Stata 绘图脚本。允许使用、修改和分发，包括商业用途；分发时须保留版权及许可声明。完整条款见许可证文件。
+- **本项目原创图片与图表采用 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)**，包括各实验目录中的图表及报告中嵌入的相同图表。允许分享、改编及商业使用；须适当署名、提供许可证链接，并标明修改，不得暗示原作者为使用者背书。
 
-模型生成内容及引用的第三方材料，其权利范围不能仅靠本仓库的许可证确定；正式授权应限于作者有权许可的部分。确认方案后，应补充许可证文件，并明确代码与非代码内容各自适用的范围。
+使用图片时，可署名为“gender-bias-experiment 项目”，并附上[本仓库链接](https://github.com/Verna1i5/gender-bias-experiment)及 CC BY 4.0 许可证链接。
 
-仓库公开不等于已经授予通用的修改、再分发许可；可参考 [GitHub 关于未指定许可证的说明](https://choosealicense.com/no-permission/)。
+以上授权不涵盖 Report 正文、其他说明文档或数据文件；这些内容尚未另行指定许可证。第三方材料不适用本项目的授权声明。
 
 ## 作者与 AI 使用声明
 
