@@ -1,0 +1,15 @@
+api_url: https://api.deepseek.com/chat/completions
+model: deepseek-flash
+repeats: 100
+seed: 20261001
+temperature: 1.0
+top_p: 1.0
+max_tokens: 65536
+stream: false
+thinking:
+  type: enabled
+# 本地 auto 表示不发送 reasoning_effort，使用服务端默认；不是 API 的枚举值。
+reasoning_effort: auto
+timeout_seconds: 90
+max_attempts: 5
+backoff_seconds: 2
