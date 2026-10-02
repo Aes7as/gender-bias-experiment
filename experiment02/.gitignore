@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.run.lock
+results/*
+!results/trials.csv
+!results/schedule.csv
+!results/summary.csv
+!results/summary.md
+!results/01_agreement_rate.png
+!results/02_response_distribution.png

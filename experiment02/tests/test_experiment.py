@@ -1,0 +1,217 @@
+"""离线验收：不读取密钥，不请求真实 API。"""
+import argparse
+import csv
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+import requests
+import run_experiment as exp
+
+
+def api_response(content):
+    return {"id": "offline-test", "choices": [{"message": {
+        "role": "assistant", "content": content, "reasoning_content": "离线思考内容"},
+        "finish_reason": "stop"}]}
+
+
+class ExperimentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.args = argparse.Namespace(model=None, repeats=2, temperature=None, seed=None,
+                                       config=None, summarize_only=False)
+        self.config, self.schedule = exp.prepare(self.directory, self.args)
+        self.config["backoff_seconds"] = 0
+
+    def test_exact_prompts_and_balanced_reproducible_blocks(self):
+        prompts = exp.read_yaml(exp.ROOT / "prompts.yaml")
+        self.assertEqual(self.schedule, exp.make_schedule(self.config, prompts))
+        self.assertEqual(len({r['trial_id'] for r in self.schedule}), 12)
+        for start in (0, 6):
+            block = self.schedule[start:start + 6]
+            self.assertEqual({(r['severity'], r['gender']) for r in block},
+                             {(s, g) for s in exp.ACTIONS for g in exp.TARGETS})
+            self.assertEqual([r['position_in_block'] for r in block], list(map(str, range(1, 7))))
+        for row in self.schedule:
+            self.assertEqual(row['prompt_text'], exp.TEMPLATE.format(
+                action=exp.ACTIONS[row['severity']], target=exp.TARGETS[row['gender']]))
+
+    def test_parser_and_full_option_matching(self):
+        for score, label in enumerate(exp.OPTIONS, 1):
+            coded = exp.classify(' \n' + label + '\t')
+            self.assertEqual(coded['response_status'], 'standard')
+            self.assertEqual(coded['response_score'], score)
+            self.assertEqual(coded['agree_binary'], int(score >= 3))
+        coded = exp.classify('我选择强烈不同意。')
+        self.assertEqual(coded['response_status'], 'nonstandard')
+        self.assertEqual(coded['response_score'], 1)
+        for text in ('强烈不同意/适度同意', '无法回答', '', None, '同意'):
+            self.assertEqual(exp.classify(text)['response_score'], '')
+
+    def test_retry_then_success_payload(self):
+        session = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = api_response('适度同意')
+        session.post.side_effect = [requests.Timeout(), response]
+        with patch.object(exp.time, 'sleep') as sleep:
+            exp.request_trial(session, self.config, self.schedule[0], 'test-key', self.directory / 'errors.jsonl')
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once()
+        payload = session.post.call_args.kwargs['json']
+        self.assertEqual(payload['messages'], [
+            {'role': 'system', 'content': 'you are a helpful assistant'},
+            {'role': 'user', 'content': self.schedule[0]['prompt_text']},
+        ])
+        self.assertEqual(payload['thinking'], {'type': 'enabled'})
+        self.assertNotIn('reasoning_effort', payload)
+        self.assertNotIn('seed', payload)
+        errors = (self.directory / 'errors.jsonl').read_text(encoding='utf-8')
+        self.assertNotIn('test-key', errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        log = (self.directory / 'requests_raw.jsonl').read_text(encoding='utf-8')
+        self.assertNotIn('test-key', log)
+        records = [json.loads(line) for line in log.splitlines()]
+        self.assertEqual([r['attempt'] for r in records], [1, 2])
+        self.assertEqual(len({r['request_id'] for r in records}), 2)
+        for record, call in zip(records, session.post.call_args_list):
+            self.assertEqual(record['payload'], call.kwargs['json'])
+            self.assertEqual(record['url'], call.args[0])
+        self.assertEqual(json.loads(errors)['request_id'], records[0]['request_id'])
+
+    def test_request_logged_before_send_and_logging_failure_blocks_send(self):
+        session = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = api_response('强烈不同意')
+        metadata = {}
+        def post(*args, **kwargs):
+            record = json.loads((self.directory / 'requests_raw.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual(record['payload'], kwargs['json'])
+            self.assertEqual(record['request_id'], metadata['request_id'])
+            return response
+        session.post.side_effect = post
+        exp.request_trial(session, self.config, self.schedule[0], 'test-key',
+                          self.directory / 'errors.jsonl', metadata)
+        session.reset_mock()
+        with patch.object(exp, 'append_json', side_effect=OSError('disk failure')):
+            with self.assertRaises(OSError):
+                exp.request_trial(session, self.config, self.schedule[0], 'test-key',
+                                  self.directory / 'errors.jsonl')
+        session.post.assert_not_called()
+
+    def test_resume_after_exhaustion_and_no_content_resampling(self):
+        session = Mock()
+        good = Mock(status_code=200)
+        good.json.return_value = api_response('拒绝回答')
+        session.post.side_effect = [good] + [requests.Timeout()] * self.config['max_attempts']
+        with self.assertRaises(RuntimeError), patch.object(exp.time, 'sleep'):
+            exp.execute(self.directory, self.config, self.schedule, 'test-key', session)
+        self.assertEqual(len(exp.read_journal(self.directory / 'responses_raw.jsonl')), 1)
+        self.assertIn('未完成', (self.directory / 'summary.md').read_text(encoding='utf-8'))
+        resumed = Mock()
+        resumed.post.return_value = good
+        exp.execute(self.directory, self.config, self.schedule, 'test-key', resumed)
+        self.assertEqual(resumed.post.call_count, 11)
+        requests_log = [json.loads(line) for line in
+                        (self.directory / 'requests_raw.jsonl').read_text(encoding='utf-8').splitlines()]
+        by_request = {r['request_id']: r for r in requests_log}
+        for record in exp.read_journal(self.directory / 'responses_raw.jsonl'):
+            self.assertEqual(by_request[record['request_id']]['trial_id'], record['trial_id'])
+        exp.execute(self.directory, self.config, self.schedule, 'test-key', resumed)
+        self.assertEqual(resumed.post.call_count, 11)
+        with (self.directory / 'summary.csv').open(encoding='utf-8-sig', newline='') as handle:
+            rows = list(csv.DictReader(handle))
+        for row in rows:
+            self.assertEqual(row['总响应数'], '2')
+            self.assertEqual(row['非标准数'], '2')
+            self.assertEqual(row['可编码数'], '0')
+            self.assertEqual(row['同意率'], 'NA')
+
+    def test_summary_denominator_and_rebuild(self):
+        target = [r for r in self.schedule if r['severity'] == 'abuse' and r['gender'] == 'male']
+        for row, text in zip(target, ('我选择适度同意。', '不回答')):
+            exp.append_json(self.directory / 'responses_raw.jsonl', {
+                'trial_id': row['trial_id'], 'timestamp_utc': exp.utc_now(), 'api_response': api_response(text)})
+        exp.materialize(self.directory, self.schedule, self.config)
+        with (self.directory / 'summary.csv').open(encoding='utf-8-sig', newline='') as handle:
+            row = next(csv.DictReader(handle))
+        self.assertEqual([row[k] for k in ('总响应数', '可编码数', '非标准数', '同意率')], ['2', '1', '2', '100.00%'])
+        expected = (self.directory / 'summary.csv').read_bytes()
+        (self.directory / 'trials.csv').unlink()
+        (self.directory / 'summary.csv').unlink()
+        exp.materialize(self.directory, self.schedule, self.config)
+        self.assertEqual(expected, (self.directory / 'summary.csv').read_bytes())
+
+    def test_snapshot_and_schedule_changes_rejected(self):
+        self.args.repeats = 3
+        with self.assertRaises(ValueError):
+            exp.prepare(self.directory, self.args)
+        self.args.repeats = 2
+        path = self.directory / 'schedule.csv'
+        path.write_text('changed', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            exp.prepare(self.directory, self.args)
+
+    def test_partial_tail_recovery_and_duplicate_rejection(self):
+        path = self.directory / 'responses_raw.jsonl'
+        record = {'trial_id': self.schedule[0]['trial_id'], 'timestamp_utc': exp.utc_now(),
+                  'api_response': api_response(None)}
+        exp.append_json(path, record)
+        with path.open('ab') as handle:
+            handle.write(b'{"partial":')
+        self.assertEqual(exp.materialize(self.directory, self.schedule, self.config), {record['trial_id']})
+        exp.append_json(path, record)
+        with self.assertRaises(ValueError):
+            exp.materialize(self.directory, self.schedule, self.config)
+
+
+    def test_all_conditions_send_system_then_original_user_and_log_exact_payload(self):
+        session = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = api_response(exp.OPTIONS[0])
+        session.post.return_value = response
+        for row in self.schedule:
+            exp.request_trial(session, self.config, row, 'test-key', self.directory / 'errors.jsonl')
+        records = [json.loads(line) for line in
+                   (self.directory / 'requests_raw.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(len(records), len(self.schedule))
+        for row, call, record in zip(self.schedule, session.post.call_args_list, records):
+            payload = call.kwargs['json']
+            self.assertEqual(payload['messages'], [
+                {'role': 'system', 'content': 'you are a helpful assistant'},
+                {'role': 'user', 'content': row['prompt_text']},
+            ])
+            self.assertEqual(record['payload'], payload)
+            self.assertEqual({k: v for k, v in payload.items() if k != 'messages'},
+                             {k: self.config[k] for k in
+                              ('model', 'temperature', 'top_p', 'max_tokens', 'stream', 'thinking')})
+
+    def test_system_prompt_snapshot_and_user_only_resume_rejected(self):
+        manifest = json.loads((self.directory / 'manifest.json').read_text(encoding='utf-8'))
+        prompts = exp.read_yaml(self.directory / 'prompts.yaml')
+        self.assertEqual(manifest['prompts']['system_prompt'], 'you are a helpful assistant')
+        self.assertEqual(prompts['system_prompt'], 'you are a helpful assistant')
+        del prompts['system_prompt']
+        manifest['prompts'] = prompts
+        (self.directory / 'prompts.yaml').write_text(exp.yaml.safe_dump(prompts, allow_unicode=True), encoding='utf-8')
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            exp.prepare(self.directory, self.args)
+
+    def test_old_and_external_output_directories_rejected_before_writing(self):
+        for directory in (exp.ROOT.parent / 'experiment' / 'results' / 'system_test',
+                          exp.ROOT.parent / 'github_release' / 'results',
+                          exp.ROOT.parent / 'github_email_fix' / 'results',
+                          exp.ROOT, self.directory):
+            with self.subTest(directory=directory), patch.object(exp, 'run_lock') as lock:
+                with self.assertRaises(SystemExit) as error:
+                    exp.main(['--prepare-only', '--output', str(directory)])
+                self.assertEqual(error.exception.code, 2)
+                lock.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()
